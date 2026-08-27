@@ -105,6 +105,29 @@ connector_setup_env() {
         fi
     fi
 
+    # Clear stale aiter JIT-build / tuned-gemm baton locks orphaned by a PRIOR
+    # killed job on this node's local persistent cache (/opt/vllm_cache is node-
+    # local NVMe). A leftover lock deadlocks every worker for 3600s ("waiting for
+    # baton release ..."). Safe because jobs run --exclusive: at container start
+    # our job solely owns the node, so any pre-existing lock is stale. Disable via
+    # CLEAN_STALE_JIT_LOCKS=0 if ever running non-exclusive (shared node).
+    if [[ "${CLEAN_STALE_JIT_LOCKS:-1}" == "1" ]]; then
+        # aiter/triton leave SEVERAL baton shapes across MORE than one root, so the
+        # old `lock_*`/`*.lock`-under-AITER_JIT_DIR glob was incomplete (it missed a
+        # bare `lock` file, which is exactly what deadlocked a run). Match all shapes:
+        #   <jit>/build/lock_<module>          top-level aiter baton   (lock_*)
+        #   <jit>/build/<module>/build/lock    per-module aiter baton  (bare 'lock')
+        #   /root/.aiter/build/<hash>/lock     aiter's OTHER cache root (bare 'lock')
+        #   <triton|comgr|vllm>/**/*.lock      triton/filelock batons  (*.lock)
+        #   /tmp/aiter_configs/*.csv.lock      tuned-config batons     (*.lock)
+        # Delete only the lock files (not partial modules — aiter rebuilds those).
+        for _lk_root in "${AITER_JIT_DIR}" "${TRITON_CACHE_DIR}" "${COMGR_CACHE_DIR}" \
+                        "${VLLM_CACHE_ROOT}" /root/.aiter /tmp/aiter_configs; do
+            [[ -d "${_lk_root}" ]] || continue
+            find "${_lk_root}" -type f \( -name 'lock' -o -name 'lock_*' -o -name '*.lock' \) -delete 2>/dev/null || true
+        done
+    fi
+
     export GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-2}"
     export HIP_FORCE_DEV_KERNARG="${HIP_FORCE_DEV_KERNARG:-1}"
     export HSA_ENABLE_SDMA="${HSA_ENABLE_SDMA:-0}"
