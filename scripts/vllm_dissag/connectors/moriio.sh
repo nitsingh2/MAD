@@ -175,6 +175,77 @@ connector_launch_worker() {
         fi
     fi
 
+    # MoRIIO sideline fix (MultiConnector + KV_OFFLOAD / prefix-cache): when MoRIIO
+    # is the non-chosen connector, update_state_after_alloc gets num_external_tokens
+    # == 0 and the WRITE-mode decode branch still sends an EMPTY remote_blocks notify.
+    # The producer raises MoRIIOError on the empty list and its notify-listener thread
+    # dies (HandshakeError), permanently breaking KV transfer; even without the crash
+    # the producer's deferred send only frees at the 60s reaper. Fix: gate the send on
+    # num_external_tokens>0 and otherwise release the producer's deferred prefill blocks
+    # so finished_sending fires immediately. Idempotent; applied per worker at launch.
+    local _moriio_conn="/usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py"
+    if [ -f "$_moriio_conn" ]; then
+        python3 - "$_moriio_conn" <<'MORIIO_SIDELINE_PATCH' || echo "[moriio-sideline-patch] WARN: patch step failed (continuing)"
+import sys
+
+P = sys.argv[1]
+MARKER = "MoRIIO sideline fix"
+
+src = open(P).read()
+if MARKER in src:
+    print("[moriio-sideline-patch] already patched")
+    sys.exit(0)
+
+old = '''                block_notify_list = (
+                    blocks.get_block_ids()[0] if num_external_tokens > 0 else []
+                )
+
+                for tp_index in range(self.tp_size):
+                    target_port = remote_notify_port + get_port_offset(
+                        remote_dp_rank, tp_index
+                    )
+
+                    self.send_notify_block(
+                        req_id=request.request_id,
+                        transfer_id=request.kv_transfer_params["transfer_id"],
+                        block_notify_list=block_notify_list,
+                        host=remote_host,
+                        port=target_port,
+                    )'''
+
+new = '''                # MoRIIO sideline fix: num_external_tokens == 0 means MoRIIO was
+                # sidelined by MultiConnector (another connector served this prefix)
+                # or a full local hit. Sending an empty remote_blocks message makes
+                # the producer raise MoRIIOError and kill its notify-listener thread;
+                # instead release the producer's deferred prefill blocks so
+                # finished_sending fires now, not at the 60s defer-timeout reaper.
+                if num_external_tokens > 0:
+                    block_notify_list = blocks.get_block_ids()[0]
+                    for tp_index in range(self.tp_size):
+                        target_port = remote_notify_port + get_port_offset(
+                            remote_dp_rank, tp_index
+                        )
+
+                        self.send_notify_block(
+                            req_id=request.request_id,
+                            transfer_id=request.kv_transfer_params["transfer_id"],
+                            block_notify_list=block_notify_list,
+                            host=remote_host,
+                            port=target_port,
+                        )
+                else:
+                    self._release_write_prefill_blocks(request.request_id, params)'''
+
+if old not in src:
+    sys.stderr.write("[moriio-sideline-patch] PATCH FAILED: anchor block not found\n")
+    sys.exit(3)
+
+src = src.replace(old, new, 1)
+open(P, "w").write(src)
+print("[moriio-sideline-patch] patched OK")
+MORIIO_SIDELINE_PATCH
+    fi
+
     # Per-role execution mode. Ported from #324: NEVER use bare --enforce-eager.
     # On these AITER images an enforce-eager worker (no +quant_fp8 custom op) routes
     # fp8 quant through an AITER op whose signature mismatches the build
