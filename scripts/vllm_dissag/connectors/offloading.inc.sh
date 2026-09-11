@@ -1,9 +1,13 @@
 #!/bin/bash
 # Tiered prefix caching — KV offload overlay (orthogonal to CONNECTOR/WIDE_EP).
-# Layers vLLM's OffloadingConnector (GPU KV -> CPU-RAM tier) on top of the disagg
-# P/D connector via MultiConnector. Load reads the first matching sub-connector,
-# save writes to all — OffloadingConnector is listed first so a decode worker hits
-# the local CPU cache before the P->D fetch. KV_OFFLOAD=none is a no-op.
+# Layers vLLM's SimpleCPUOffloadConnector (GPU KV -> CPU-RAM tier) on top of the
+# disagg P/D connector via MultiConnector. Load reads the first matching
+# sub-connector, save writes to all — the offload connector is listed first so a
+# decode worker hits the local CPU cache before the P->D fetch. KV_OFFLOAD=none is
+# a no-op.
+# NOTE: previously OffloadingConnector; swapped for SimpleCPUOffloadConnector
+# because OffloadingConnector's _build_store_jobs invariant asserts under MoRIIO
+# write-mode disagg. Old connector dict kept commented in kv_offload_wrap below.
 #
 # Env: KV_OFFLOAD        = none (default) | cpu
 #      OFFLOAD_CPU_BYTES = pinned host bytes for the CPU tier (default 100 GB)
@@ -43,8 +47,20 @@ base = json.loads(os.environ["_BASE_JSON"])
 # base dict to the outer MultiConnector; vLLM's fallback (ktc.get("engine_id",
 # outer.engine_id)) then re-applies it to the base (and offload) sub-connector.
 engine_id = base.pop("engine_id", None)
+# --- Legacy OffloadingConnector: its _build_store_jobs strided block-id invariant
+# --- (offloading/scheduler.py) desyncs under MoRIIO write-mode disagg and asserts
+# --- on warm reuse (offload_keys outruns block_ids). Swapped for
+# --- SimpleCPUOffloadConnector, whose store path is hash-driven (no paired-array
+# --- invariant). Kept commented for easy revert.
+# offload = {
+#     "kv_connector": "OffloadingConnector",
+#     "kv_role": "kv_both",
+#     "kv_connector_extra_config": {
+#         "cpu_bytes_to_use": int(os.environ["OFFLOAD_CPU_BYTES"]),
+#     },
+# }
 offload = {
-    "kv_connector": "OffloadingConnector",
+    "kv_connector": "SimpleCPUOffloadConnector",
     "kv_role": "kv_both",
     "kv_connector_extra_config": {
         "cpu_bytes_to_use": int(os.environ["OFFLOAD_CPU_BYTES"]),
