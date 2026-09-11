@@ -56,7 +56,7 @@ connector_setup_env() {
     export VLLM_ROCM_USE_AITER_PAGED_ATTN=0
     export VLLM_USE_AITER_TRITON_SILU_MUL=0
 
-    export VLLM_LOGGING_LEVEL=INFO
+    export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-INFO}
     export VLLM_USE_V1=1
     export VLLM_ALL2ALL_BACKEND=mori
 
