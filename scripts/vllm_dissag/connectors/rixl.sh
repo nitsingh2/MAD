@@ -317,7 +317,7 @@ _rixl_launch_deepep() {
     kv_config=$(kv_offload_wrap "${kv_config}")
 
     # Prefix caching: OFF by default; the user can force it on via
-    # ENABLE_PREFIX_CACHING=1. OffloadingConnector requires it, so it is forced on
+    # ENABLE_PREFIX_CACHING=1. SimpleCPUOffloadConnector requires it, so it is forced on
     # whenever KV_OFFLOAD is active (regardless of the knob). Decoupling APC from
     # KV_OFFLOAD lets the `none` arm of a KV-offload A/B also run with APC on.
     local _pc="${ENABLE_PREFIX_CACHING:-0}"

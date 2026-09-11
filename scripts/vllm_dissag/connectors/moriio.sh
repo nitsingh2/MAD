@@ -292,8 +292,8 @@ MORIIO_SIDELINE_PATCH
         fi
 
         # Prefix caching: OFF by default; the user can force it on via
-        # ENABLE_PREFIX_CACHING=1. OffloadingConnector requires it, so it is
-        # forced on whenever KV_OFFLOAD is active (regardless of the knob).
+        # ENABLE_PREFIX_CACHING=1. SimpleCPUOffloadConnector requires it, so it
+        # is forced on whenever KV_OFFLOAD is active (regardless of the knob).
         local _pc="${ENABLE_PREFIX_CACHING:-0}"
         kv_offload_enabled && _pc=1
         local _prefix_cache_arg="--no-enable-prefix-caching"

@@ -20,7 +20,7 @@ kv_offload_enabled() {
 }
 
 # Echo the kv-transfer-config for `vllm serve`: base JSON unchanged when none,
-# else a MultiConnector wrapping [OffloadingConnector, base].
+# else a MultiConnector wrapping [SimpleCPUOffloadConnector, base].
 kv_offload_wrap() {
     local base_json="$1"
     if ! kv_offload_enabled; then
@@ -47,18 +47,6 @@ base = json.loads(os.environ["_BASE_JSON"])
 # base dict to the outer MultiConnector; vLLM's fallback (ktc.get("engine_id",
 # outer.engine_id)) then re-applies it to the base (and offload) sub-connector.
 engine_id = base.pop("engine_id", None)
-# --- Legacy OffloadingConnector: its _build_store_jobs strided block-id invariant
-# --- (offloading/scheduler.py) desyncs under MoRIIO write-mode disagg and asserts
-# --- on warm reuse (offload_keys outruns block_ids). Swapped for
-# --- SimpleCPUOffloadConnector, whose store path is hash-driven (no paired-array
-# --- invariant). Kept commented for easy revert.
-# offload = {
-#     "kv_connector": "OffloadingConnector",
-#     "kv_role": "kv_both",
-#     "kv_connector_extra_config": {
-#         "cpu_bytes_to_use": int(os.environ["OFFLOAD_CPU_BYTES"]),
-#     },
-# }
 offload = {
     "kv_connector": "SimpleCPUOffloadConnector",
     "kv_role": "kv_both",
