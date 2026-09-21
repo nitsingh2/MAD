@@ -11,6 +11,10 @@
 # Per-model FLAGS come from models.yaml via the driver ($MODEL_CONFIG_<ROLE>).
 # Per-model ENV is exported by the driver (yaml env:) BEFORE connector_setup_env,
 # so the ${VAR:-default} fallbacks below yield to any model/site override.
+#
+# Optional env overrides:
+#   MORIIO_READ_MODE=1   Enable MoRIIO READ mode (decode pulls KV from prefill).
+#                        Default: 0 (WRITE mode, prefill pushes to decode).
 # =============================================================================
 
 connector_init() {
@@ -56,7 +60,7 @@ connector_setup_env() {
     export VLLM_ROCM_USE_AITER_PAGED_ATTN=0
     export VLLM_USE_AITER_TRITON_SILU_MUL=0
 
-    export VLLM_LOGGING_LEVEL=INFO
+    export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-INFO}
     export VLLM_USE_V1=1
     export VLLM_ALL2ALL_BACKEND=mori
 
@@ -86,10 +90,14 @@ connector_setup_env() {
     export VLLM_MORIIO_DEFERRED_TIMEOUT_S="${VLLM_MORIIO_DEFERRED_TIMEOUT_S:-1800}"
     export VLLM_HANDSHAKE_TIMEOUT_MINS="${VLLM_HANDSHAKE_TIMEOUT_MINS:-30}"
 
-    export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/vllm_cache/triton}"
-    export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/tmp/vllm_cache/vllm}"
-    export COMGR_CACHE_DIR="${COMGR_CACHE_DIR:-/tmp/vllm_cache/comgr}"
-    export AITER_JIT_DIR="${AITER_JIT_DIR:-/tmp/vllm_cache/aiter_jit}"
+    # Default the JIT caches to the image-keyed, per-user persistent mount (/opt/vllm_cache)
+    # NOT the world-shared /tmp/vllm_cache: the latter is bind-mounted from the host and gets
+    # poisoned by other users' JIT builds from newer-toolchain images (e.g. an aiter .so needing
+    # a GLIBCXX this image lacks), which aborts every worker. /opt/vllm_cache is keyed by image ID.
+    export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/opt/vllm_cache/triton}"
+    export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/opt/vllm_cache/vllm}"
+    export COMGR_CACHE_DIR="${COMGR_CACHE_DIR:-/opt/vllm_cache/comgr}"
+    export AITER_JIT_DIR="${AITER_JIT_DIR:-/opt/vllm_cache/aiter_jit}"
     mkdir -p "${TRITON_CACHE_DIR}" "${VLLM_CACHE_ROOT}" "${COMGR_CACHE_DIR}" "${AITER_JIT_DIR}" 2>/dev/null || true
 
     if [[ "${VLLM_ROCM_USE_AITER:-1}" == "1" ]]; then
@@ -99,6 +107,29 @@ connector_setup_env() {
             mkdir -p "${_aiter_cfgs}"
             cp "${_aiter_src}"/*.csv "${_aiter_cfgs}/" 2>/dev/null || true
         fi
+    fi
+
+    # Clear stale aiter JIT-build / tuned-gemm baton locks orphaned by a PRIOR
+    # killed job on this node's local persistent cache (/opt/vllm_cache is node-
+    # local NVMe). A leftover lock deadlocks every worker for 3600s ("waiting for
+    # baton release ..."). Safe because jobs run --exclusive: at container start
+    # our job solely owns the node, so any pre-existing lock is stale. Disable via
+    # CLEAN_STALE_JIT_LOCKS=0 if ever running non-exclusive (shared node).
+    if [[ "${CLEAN_STALE_JIT_LOCKS:-1}" == "1" ]]; then
+        # aiter/triton leave SEVERAL baton shapes across MORE than one root, so the
+        # old `lock_*`/`*.lock`-under-AITER_JIT_DIR glob was incomplete (it missed a
+        # bare `lock` file, which is exactly what deadlocked a run). Match all shapes:
+        #   <jit>/build/lock_<module>          top-level aiter baton   (lock_*)
+        #   <jit>/build/<module>/build/lock    per-module aiter baton  (bare 'lock')
+        #   /root/.aiter/build/<hash>/lock     aiter's OTHER cache root (bare 'lock')
+        #   <triton|comgr|vllm>/**/*.lock      triton/filelock batons  (*.lock)
+        #   /tmp/aiter_configs/*.csv.lock      tuned-config batons     (*.lock)
+        # Delete only the lock files (not partial modules — aiter rebuilds those).
+        for _lk_root in "${AITER_JIT_DIR}" "${TRITON_CACHE_DIR}" "${COMGR_CACHE_DIR}" \
+                        "${VLLM_CACHE_ROOT}" /root/.aiter /tmp/aiter_configs; do
+            [[ -d "${_lk_root}" ]] || continue
+            find "${_lk_root}" -type f \( -name 'lock' -o -name 'lock_*' -o -name '*.lock' \) -delete 2>/dev/null || true
+        done
     fi
 
     export GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-2}"
@@ -120,16 +151,12 @@ connector_setup_env() {
 
 _moriio_build_kv_transfer_config() {
     local kv_role="$1"
-    echo '{"kv_connector":"MoRIIOConnector","kv_role":"'"${kv_role}"'","kv_port":"'"${KV_PORT}"'","kv_connector_extra_config":{"proxy_ip":"'"${MASTER_ADDR}"'","proxy_port":"'"${PROXY_PORT}"'","proxy_ping_port":"'"${PROXY_PING_PORT}"'","http_port":"'"${SERVE_PORT}"'","local_ping_port":"'"${LOCAL_PING_PORT}"'","handshake_port":"'"${HANDSHAKE_PORT}"'","notify_port":"'"${NOTIFY_PORT}"'"}}'
+    local read_mode_val="false"
+    [[ "${MORIIO_READ_MODE:-0}" == "1" ]] && read_mode_val="true"
+    echo '{"kv_connector":"MoRIIOConnector","kv_role":"'"${kv_role}"'","kv_port":"'"${KV_PORT}"'","kv_connector_extra_config":{"read_mode":'"${read_mode_val}"',"proxy_ip":"'"${MASTER_ADDR}"'","proxy_port":"'"${PROXY_PORT}"'","proxy_ping_port":"'"${PROXY_PING_PORT}"'","http_port":"'"${SERVE_PORT}"'","local_ping_port":"'"${LOCAL_PING_PORT}"'","handshake_port":"'"${HANDSHAKE_PORT}"'","notify_port":"'"${NOTIFY_PORT}"'"}}'
 }
 
 connector_runtime_patch() {
-    # No-op: the MoRIIO multi-node disagg fixes (vLLM PR#39276 notify-path, #41751 LL
-    # split, DP-rank hash-failsafe) are committed in-source in the vLLM the image is
-    # built from (see the Dockerfile VLLM_REF). There is no runtime .py patcher — that
-    # would be a drifting duplicate of fixes that already live upstream in the fork.
-    # If you ever run an image WITHOUT these fixes baked, use an image that has them
-    # (rebuild from the pinned VLLM_REF) rather than patching a stock image at runtime.
     return 0
 }
 
@@ -146,6 +173,53 @@ connector_launch_worker() {
         if [ -f "$_torch_const" ]; then
             sed -i "s/default_pg_timeout: timedelta = _DEFAULT_PG_TIMEOUT/default_pg_timeout: timedelta = timedelta(seconds=${_timeout_s})/" "$_torch_const" 2>/dev/null || true
         fi
+    fi
+
+    # MoRIIO sideline fix (MultiConnector + KV_OFFLOAD / prefix-cache): when MoRIIO
+    # is the non-chosen connector, update_state_after_alloc gets num_external_tokens
+    # == 0 and the WRITE-mode decode branch still sends an EMPTY remote_blocks notify.
+    # The producer raises MoRIIOError on the empty list and its notify-listener thread
+    # dies (HandshakeError), permanently breaking KV transfer; even without the crash
+    # the producer's deferred send only frees at the 60s reaper. Fix: gate the send on
+    # num_external_tokens>0 and otherwise release the producer's deferred prefill blocks
+    # so finished_sending fires immediately. Idempotent; applied per worker at launch.
+    local _moriio_conn="/usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py"
+    if [ -f "$_moriio_conn" ]; then
+        python3 - "$_moriio_conn" <<'MORIIO_SIDELINE_PATCH' || echo "[moriio-sideline-patch] WARN: patch step failed (continuing)"
+import sys
+
+P = sys.argv[1]
+MARKER = "MoRIIO sideline fix"
+
+src = open(P).read()
+if MARKER in src:
+    print("[moriio-sideline-patch] already patched")
+    sys.exit(0)
+
+old = '''                    block_notify_list = (
+                        blocks.get_block_ids()[0] if num_external_tokens > 0 else []
+                    )'''
+
+new = '''                    if num_external_tokens == 0:
+                        # MoRIIO sideline fix: no tokens to pull here (sidelined by
+                        # MultiConnector or a full local hit). An empty notify makes
+                        # the producer reject it (HandshakeError) and hold its
+                        # deferred prefill blocks until the defer timeout, exhausting
+                        # the prefill pool under warm concurrency; send a release so
+                        # the producer frees those blocks immediately.
+                        self._release_write_prefill_blocks(request.request_id, params)
+                        params["do_remote_prefill"] = False
+                        return
+                    block_notify_list = blocks.get_block_ids()[0]'''
+
+if old not in src:
+    sys.stderr.write("[moriio-sideline-patch] PATCH FAILED: anchor block not found\n")
+    sys.exit(3)
+
+src = src.replace(old, new, 1)
+open(P, "w").write(src)
+print("[moriio-sideline-patch] patched OK")
+MORIIO_SIDELINE_PATCH
     fi
 
     # Per-role execution mode. Ported from #324: NEVER use bare --enforce-eager.
@@ -186,10 +260,20 @@ connector_launch_worker() {
         if [[ "$role" == "master" ]]; then
             extra_args+=(--api-server-count=${_GPUS_PER_NODE})
             local kv_config; kv_config=$(_moriio_build_kv_transfer_config "${kv_role}")
+            # KV_OFFLOAD wrap: MultiConnector[Offloading, base] when cpu, else no-op.
+            kv_config=$(kv_offload_wrap "${kv_config}")
             kv_args+=(--kv-transfer-config "${kv_config}")
         else
             extra_args+=(--data-parallel-start-rank "${dp_start_rank}" --headless)
         fi
+
+        # Prefix caching: OFF by default; the user can force it on via
+        # ENABLE_PREFIX_CACHING=1. SimpleCPUOffloadConnector requires it, so it
+        # is forced on whenever KV_OFFLOAD is active (regardless of the knob).
+        local _pc="${ENABLE_PREFIX_CACHING:-0}"
+        kv_offload_enabled && _pc=1
+        local _prefix_cache_arg="--no-enable-prefix-caching"
+        [[ "$_pc" == "1" ]] && _prefix_cache_arg="--enable-prefix-caching"
 
         # Recipe knobs (overridable via env / models.yaml). DeepSeek-V3 on AITER
         # needs block=16 + MLA off (the block=1 + AITER-MLA fp8 decode kernel
@@ -200,6 +284,11 @@ connector_launch_worker() {
         local _kvdtype="${KV_CACHE_DTYPE:-fp8}"
         local mem_args=()
         [[ -n "${KV_CACHE_MEMORY_BYTES:-}" ]] && mem_args+=(--kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}")
+        # Optional context cap. Only emitted when a model recipe / submit sets it;
+        # the connector stays model-agnostic (no default). Needed for MLA models
+        # whose default max_model_len makes the TritonMLA attn-logits workspace OOM.
+        local mml_args=()
+        [[ -n "${MAX_MODEL_LEN:-}" ]] && mml_args+=(--max-model-len "${MAX_MODEL_LEN}")
 
         if [[ "${DRY_RUN:-0}" == "1" ]]; then
             _dryrun_emit "moriio" "${log_prefix}" "${role}" \
@@ -215,8 +304,9 @@ connector_launch_worker() {
                     "${mem_args[@]}" \
                     --kv-cache-dtype "${_kvdtype}" \
                     --block-size "${_block}" \
-                    --no-enable-prefix-caching \
+                    "${_prefix_cache_arg}" \
                     --all2all-backend "${_all2all}" \
+                    "${mml_args[@]}" \
                     --trust-remote-code \
                     --distributed-timeout-seconds "${DISTRIBUTED_TIMEOUT_SECONDS:-7200}" \
                     "${exec_args[@]}" "${extra_args[@]}" "${kv_args[@]}"
@@ -235,8 +325,9 @@ connector_launch_worker() {
             "${mem_args[@]}" \
             --kv-cache-dtype "${_kvdtype}" \
             --block-size "${_block}" \
-            --no-enable-prefix-caching \
+            "${_prefix_cache_arg}" \
             --all2all-backend "${_all2all}" \
+            "${mml_args[@]}" \
             --trust-remote-code \
             --distributed-timeout-seconds ${DISTRIBUTED_TIMEOUT_SECONDS:-7200} \
             "${exec_args[@]}" \
