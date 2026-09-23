@@ -69,8 +69,8 @@ _has    "$O" "--enable-prefix-caching" "prefix caching enabled under offload"
 _hasnot "$O" "--no-enable-prefix-caching" "no --no-enable-prefix-caching under offload"
 
 echo ""
-echo "=== KV_OFFLOAD=cpu native + OFFLOAD_DISK_PATH (fs tier; rixl TP 405B) ==="
-OF="$(_argv_off rixl 0 '' Llama-3.1-405B-Instruct-FP8-KV /m/L405 cpu native /mnt/kv)"
+echo "=== KV_OFFLOAD=fs native (CPU+fs tier; rixl TP 405B) ==="
+OF="$(_argv_off rixl 0 '' Llama-3.1-405B-Instruct-FP8-KV /m/L405 fs native /mnt/kv)"
 _has    "$OF" "OffloadingConnector" "native OffloadingConnector on the fs path"
 _has    "$OF" "cpu_bytes_to_use" "CPU tier preserved with an fs tier below it"
 _has    "$OF" "TieringOffloadingSpec" "fs tier uses TieringOffloadingSpec"
@@ -101,10 +101,10 @@ _hasnot "$N" "OffloadingConnector" "no OffloadingConnector when offload disabled
 _has    "$N" "--no-enable-prefix-caching" "prefix caching stays off (base recipe)"
 
 echo ""
-echo "=== KV_OFFLOAD=cpu lmcache + OFFLOAD_DISK_PATH (disk tier; rixl TP 405B) ==="
-LD="$(_argv_off rixl 0 '' Llama-3.1-405B-Instruct-FP8-KV /m/L405 cpu lmcache /mnt/kv)"
-_has    "$LD" "LMCacheConnectorV1" "lmcache connector present on lmcache+disk path"
-_hasnot "$LD" "OffloadingConnector" "no native connector on lmcache+disk path"
+echo "=== KV_OFFLOAD=fs lmcache (CPU+fs tier; rixl TP 405B) ==="
+LD="$(_argv_off rixl 0 '' Llama-3.1-405B-Instruct-FP8-KV /m/L405 fs lmcache /mnt/kv)"
+_has    "$LD" "LMCacheConnectorV1" "lmcache connector present on lmcache fs path"
+_hasnot "$LD" "OffloadingConnector" "no native connector on lmcache fs path"
 _has    "$LD" "NixlConnector"       "base NixlConnector preserved"
 _has    "$LD" "--enable-prefix-caching" "prefix caching enabled"
 
@@ -126,8 +126,9 @@ _kv_driver_exit() {  # KV_OFFLOAD [OFFLOAD_BACKEND]
     GPUS_PER_NODE=8 SLURM_JOB_ID=ASSERT PROXY_TYPE=vllm_router ROUTER_PORT=30000 \
     bash "$DIR/vllm_disagg.sh"
 }
-_exits_nonzero "KV_OFFLOAD=bad rejected"      _kv_driver_exit bad
-_exits_nonzero "OFFLOAD_BACKEND=bad rejected" _kv_driver_exit cpu bad
+_exits_nonzero "KV_OFFLOAD=bad rejected"        _kv_driver_exit bad
+_exits_nonzero "OFFLOAD_BACKEND=bad rejected"  _kv_driver_exit cpu bad
+_exits_nonzero "KV_OFFLOAD=fs without OFFLOAD_DISK_PATH rejected" _kv_driver_exit fs native
 
 echo ""
 echo "=== connector platform env files carry the RDMA-fix env ==="

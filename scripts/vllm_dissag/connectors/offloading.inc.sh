@@ -27,7 +27,7 @@
 #      OFFLOAD_CPU_BYTES = pinned host bytes for the native CPU tier (default 100 GB)
 #      LMCACHE_MAX_LOCAL_CPU_SIZE  = per-worker CPU tier in GB for lmcache (default 100.0)
 #      OFFLOAD_DISK_PATH           = base dir for the filesystem tier (required when KV_OFFLOAD=fs).
-#                                    Node-local disk (e.g. /mnt/m2m_nobackup/...), NOT tmpfs.
+#                                    Node-accessible storage (NVMe or NFS). NOT tmpfs.
 #      LMCACHE_MAX_LOCAL_DISK_SIZE = lmcache only: per-worker disk tier in GB (default 0.0)
 
 KV_OFFLOAD="${KV_OFFLOAD:-none}"

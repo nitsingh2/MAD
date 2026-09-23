@@ -136,54 +136,68 @@ export CONNECTOR=rixl WIDE_EP=1 EP_BACKEND=deepep
 
 An orthogonal overlay that attaches a CPU-RAM KV tier (GPU KV → host, for prefix reuse)
 *on top of* the NIXL disagg connector, by composing both via vLLM's `MultiConnector`. The
-tier's backend is selectable via `OFFLOAD_BACKEND`:
+two axes — tier topology (`KV_OFFLOAD`) and CPU tier backend (`OFFLOAD_BACKEND`) — are
+independently selectable, giving a 2×2 matrix of options:
 
-- **`lmcache`** — LMCache's `LMCacheConnectorV1`, sized by `LMCACHE_MAX_LOCAL_CPU_SIZE`.
-  **Validated and optimal** on `Llama-3.1-405B-Instruct-FP8-KV` (1P/1D, TP=8).
-- **`native`** (code default) — vLLM's built-in `OffloadingConnector`, sized by `OFFLOAD_CPU_BYTES`.
-  Functional but not benchmarked; prefer `lmcache`.
+| | `OFFLOAD_BACKEND=native` | `OFFLOAD_BACKEND=lmcache` |
+|---|---|---|
+| `KV_OFFLOAD=cpu` | CPU tier, OffloadingConnector | CPU tier, LMCacheConnectorV1 |
+| `KV_OFFLOAD=fs` | CPU + fs tier, OffloadingConnector | CPU + fs tier, LMCacheConnectorV1 |
 
-Either backend can add a filesystem tier below the CPU tier (GPU → CPU RAM → disk) via
-`OFFLOAD_DISK_PATH`: `native` attaches a `TieringOffloadingSpec` `fs` secondary tier;
-`lmcache` (LRU) spills CPU-evicted chunks to its `local_disk`. Neither disk path is
-validated — set `OFFLOAD_DISK_PATH` only if you have a node-local fast disk and accept
-that it is experimental.
+`lmcache` is recommended for prefix-heavy workloads. `native` is simpler to deploy (no
+extra image). The fs tier extends capacity via local NVMe when the working set exceeds
+available CPU RAM; it requires `OFFLOAD_DISK_PATH` pointing to node-local storage (not a
+network FS).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `KV_OFFLOAD` | `none` | `none` (off) or `cpu` (CPU-RAM tier) |
-| `OFFLOAD_BACKEND` | `native` | `native` (OffloadingConnector) or `lmcache` (LMCacheConnectorV1) |
+| `KV_OFFLOAD` | `none` | `none` (off) \| `cpu` (CPU-RAM tier) \| `fs` (CPU-RAM + fs tier) |
+| `OFFLOAD_BACKEND` | `native` | `native` (OffloadingConnector) \| `lmcache` (LMCacheConnectorV1) |
+| `OFFLOAD_CPU_BYTES` | `107374182400` (100 GB) | native only: pinned host bytes for the CPU tier |
 | `LMCACHE_MAX_LOCAL_CPU_SIZE` | `100.0` | lmcache only: **per-worker** CPU tier in GB |
-| `OFFLOAD_CPU_BYTES` | `107374182400` (100 GB) | native only: instance-wide pinned host bytes |
-| `OFFLOAD_DISK_PATH` | (unset) | either backend: base dir for an fs tier below CPU (unset = no disk tier). Node-local disk (e.g. `/mnt/m2m_nobackup/...`), **not** a network FS. A per-host subdir is appended |
-| `LMCACHE_MAX_LOCAL_DISK_SIZE` | `0.0` | lmcache only: **per-worker** disk tier in GB |
+| `OFFLOAD_DISK_PATH` | (unset) | `KV_OFFLOAD=fs`: base dir for the fs tier (NVMe or NFS, node-accessible). A per-host subdir is appended. |
+| `LMCACHE_MAX_LOCAL_DISK_SIZE` | `0.0` | lmcache only: **per-worker** fs tier in GB |
+| `DISABLE_HOST_RDMA_MOUNTS` | `0` | Set to `1` to skip host rdma-core bind-mounts (use when host and container rdma-core ABI versions differ) |
 
 ```bash
-# NIXL (rixl) TP Llama-3.1-405B with CPU-tier prefix caching — native (default)
-export CONNECTOR=rixl WIDE_EP=0 KV_OFFLOAD=cpu           # OFFLOAD_BACKEND=native implied
+# ── native · CPU tier ────────────────────────────────────────────────────────
+export CONNECTOR=rixl WIDE_EP=0 KV_OFFLOAD=cpu OFFLOAD_BACKEND=native
+export OFFLOAD_CPU_BYTES=55834574848   # 52 GB/worker — size to cover your prefix working set
+export KV_CACHE_MEMORY_BYTES=32000000000  # cap HBM so blocks evict into the CPU tier
 export MODEL_NAME=Llama-3.1-405B-Instruct-FP8-KV xP=1 yD=1
-export KV_CACHE_MEMORY_BYTES=8000000000     # small HBM KV cap so eviction feeds the CPU tier
-export BENCHMARK_SCRIPT=prefix_cache        # cold+warm two-pass to measure cache hits
 sbatch -N 2 -n 2 --nodelist=<node0,node1> run_xPyD_models.slurm
 
-# Same, but LMCache as the CPU-tier backend (A/B against native)
-export OFFLOAD_BACKEND=lmcache
-export LMCACHE_MAX_LOCAL_CPU_SIZE=100.0      # per-worker GB (LMCache semantics)
-export DOCKER_IMAGE_NAME=<your-lmcache-image>  # MUST have `lmcache` installed (see below)
+# ── native · CPU + fs tier ───────────────────────────────────────────────────
+export KV_OFFLOAD=fs
+export OFFLOAD_CPU_BYTES=10737418240   # 10 GB/worker hot CPU tier
+export OFFLOAD_DISK_PATH=/mnt/kv_offload  # node-accessible storage (NVMe or NFS)
+sbatch -N 2 -n 2 --nodelist=<node0,node1> run_xPyD_models.slurm
+
+# ── lmcache · CPU tier ───────────────────────────────────────────────────────
+export KV_OFFLOAD=cpu OFFLOAD_BACKEND=lmcache
+export LMCACHE_MAX_LOCAL_CPU_SIZE=52.0  # per-worker GB
+export KV_CACHE_MEMORY_BYTES=32000000000
+export DOCKER_IMAGE_NAME=<lmcache-image>  # must have lmcache v0.5.3+ installed
+export DISABLE_HOST_RDMA_MOUNTS=1        # if host rdma-core ABI differs from container
+sbatch -N 2 -n 2 --nodelist=<node0,node1> run_xPyD_models.slurm
+
+# ── lmcache · CPU + fs tier ──────────────────────────────────────────────────
+export KV_OFFLOAD=fs
+export LMCACHE_MAX_LOCAL_CPU_SIZE=10.0        # 10 GB/worker hot CPU tier
+export OFFLOAD_DISK_PATH=/mnt/kv_offload        # node-accessible storage (NVMe or NFS)
+export LMCACHE_MAX_LOCAL_DISK_SIZE=100.0        # 100 GB/worker fs tier
 sbatch -N 2 -n 2 --nodelist=<node0,node1> run_xPyD_models.slurm
 ```
 
-When `KV_OFFLOAD!=none` the launcher forces `--enable-prefix-caching` (offloading is
-meaningless without it); pair it with a small `--kv-cache-memory-bytes` cap so HBM KV
-actually evicts into the CPU tier.
+When `KV_OFFLOAD!=none` the launcher forces `--enable-prefix-caching`. Pair it with a
+small `--kv-cache-memory-bytes` cap so HBM KV actually evicts into the CPU tier.
 
-**Image requirements.** `native` needs an image whose vLLM ships `OffloadingConnector` +
-`MultiConnector` (e.g. `vllm/vllm-openai-rocm:v0.26.0`). `lmcache` **additionally** needs
-`lmcache` (v0.5.3+) installed — the stock image does **not** ship it, and `LMCacheConnectorV1`
-will fail to import without it. Build one from source (`BUILD_WITH_HIP=1`,
-`PYTORCH_ROCM_ARCH=gfx942` for MI300) and point `DOCKER_IMAGE_NAME` at it. LMCache reads
-its tier config from the process env (`LMCACHE_MAX_LOCAL_CPU_SIZE`, `PYTHONHASHSEED`,
-`PROMETHEUS_MULTIPROC_DIR`), all forwarded into the container by the slurm.
+**Image requirements.** `native` needs a vLLM image shipping `OffloadingConnector` +
+`MultiConnector` (e.g. `vllm/vllm-openai-rocm:nightly`). `lmcache` **additionally** needs
+`lmcache` (v0.5.3+) — the stock image does **not** ship it. Build one from source and point
+`DOCKER_IMAGE_NAME` at it. LMCache reads its tier config from the process env
+(`LMCACHE_MAX_LOCAL_CPU_SIZE`, `PYTHONHASHSEED`, `PROMETHEUS_MULTIPROC_DIR`), all
+forwarded into the container by the slurm.
 
 Each followed by:
 ```bash
@@ -493,9 +507,17 @@ Thresholds: `AGENTIC_MAX_ERROR_RATE` (default `0.10`, gates PASS/WARN) and `AGEN
 
 `benchmark_prefix_cache.sh` sends a large shared prefix with a fixed seed, then runs the
 identical request set twice (cold → warm) so the TTFT drop shows the tiered-cache benefit.
-Select it with
-`export BENCHMARK_SCRIPT=prefix_cache`; tune via `PC_PREFIX_LEN`, `PC_ISL`, `PC_OSL`,
-`PC_NUM_PROMPTS`, `PC_CON`, `PC_SEED`.
+Select via `export BENCHMARK_SCRIPT=prefix_cache`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PC_PREFIX_LEN` | `4096` | Shared prefix length in tokens |
+| `PC_ISL` | `1024` | Unique input tokens per request (after prefix) |
+| `PC_OSL` | `128` | Output tokens per request |
+| `PC_NUM_PROMPTS` | `64` | Requests per cold/warm pass |
+| `PC_CON` | `32` | Concurrency (single point); ignored if `PC_CON_LIST` is set |
+| `PC_CON_LIST` | (uses `PC_CON`) | Space-separated concurrency sweep, e.g. `"8 16 32 64"` |
+| `PC_SEED` | `12345` | Base RNG seed; each concurrency point gets `seed + index` so cold passes are genuinely cold |
 
 ## Testing the launcher (no GPUs)
 
